@@ -9,286 +9,425 @@ import MapKit
 
 struct MapView: View {
 
-    @State
-    private var cameraPosition = MapCameraPosition.region(
-        MKCoordinateRegion(
-            center: CLLocationCoordinate2D(
-                latitude: 48.2082,
-                longitude: 16.3738
-            ),
-            span: MKCoordinateSpan(
-                latitudeDelta: 0.05,
-                longitudeDelta: 0.05
-            )
-        )
-    )
-    
-    @State
-    private var style = StyleOptions.standard
-    
-    @State
-    private var transport = TransportType.walking
-    
-    @State
-    private var places = locations
+    // camera
+    @State private var cameraPosition: MapCameraPosition = .region(Location.vienna)
+    @State private var camera: MapCamera?
+    @State private var visibleRegion: MKCoordinateRegion?
 
-    @State
-    private var selectedIDs: [UUID] = []
+    // mapStyle and route configs
+    @State private var styleSettings = MapStyleSettings()
+    @State private var transport = TransportType.walking
+    @State private var avoidHighways = false
 
-    @State
-    private var selection: UUID?
+    // locations, selected stops, calculated routes, follow route
+    @State private var places = Location.samples
+    @State private var stopIDs: [UUID] = []
+    @State private var selection: MapSelection<UUID>? // either own object (marker, annotation) or apple POI
+    @State private var legs: [RouteLeg] = []
+    @State private var isCalculating = false
+    @State private var followTask: Task<Void, Never>?
 
-    @State
-    private var legs: [MKRoute] = []
-    
-    @State
-    private var visibleRegion: MKCoordinateRegion?
-    
-    @State
-    private var query = ""
-    
-    // found place (search), shown as marker + result card
-    @State
-    private var result: MKMapItem?
-    
-    @State
-    private var showDetails = false
-    
-    @State
-    private var completer = SearchCompleter()
-    
-    @State
-    private var followRoute = false
+    // search for place & look around
+    @State private var query = ""
+    @State private var completer = SearchCompleter()
+    @State private var result: MKMapItem?
+    @State private var lookAroundScene: MKLookAroundScene?
+    @State private var showDetails = false
+
+    @State private var locationManager = CLLocationManager()
+
+    private var stops: [Location] {
+        stopIDs.compactMap { id in places.first { $0.id == id } }
+    }
 
     var body: some View {
         NavigationStack {
             MapReader { proxy in
                 Map(position: $cameraPosition, interactionModes: .all, selection: $selection) {
-                    placeMarkers
+                    UserAnnotation()
                     routeLines
+                    placeContent
                     if let result {
-                        Marker(item: result)
+                        Marker(item: result).tint(.green)
                     }
                 }
-                .mapStyle(style.mapStyle)
-                .mapControls { MapCompass() }
-                .onMapCameraChange(frequency: .onEnd) {
-                    visibleRegion = $0.region
-                    completer.region = $0.region
+                .mapStyle(styleSettings.mapStyle)
+                .mapControls {
+                    MapUserLocationButton()
+                    MapCompass()
+                    MapPitchToggle()
+                    MapScaleView()
                 }
-                .simultaneousGesture(createLocation(proxy))
+                .onMapCameraChange(frequency: .onEnd) { context in
+                    camera = context.camera
+                    visibleRegion = context.region
+                    completer.region = context.region
+                }
+                .simultaneousGesture(addPlaceGesture(proxy))
+                .overlay(alignment: .trailing) { zoomButtons }
             }
             .navigationTitle("MapKit Demo")
             .navigationBarTitleDisplayMode(.inline)
             // suggestions while typing
-            .searchable(text: $query) {
+            .searchable(text: $query, prompt: "Ort suchen")
+            .searchSuggestions {
                 ForEach(completer.results, id: \.self) { s in
-                    Button { Task { await selectLocation(s) } } label: {
+                    Button { Task { await selectCompletion(s) } } label: {
                         VStack(alignment: .leading) {
                             Text(s.title)
-                            Text(s.subtitle).font(.caption)
+                            Text(s.subtitle).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
             }
             .onChange(of: query) { _, q in completer.query = q }
-            .onSubmit(of: .search) { Task { await searchMap() } }
-            .toolbar {
-                // reset everything
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Reset", systemImage: "trash") {
-                        places = locations; selectedIDs = []; legs = []
-                        result = nil
-                    }
-                }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button("Follow Route", systemImage: "play.fill") { Task { await followRoute() } }
-                        .disabled(legs.isEmpty || followRoute)
-                    Menu("Style", systemImage: "map") {
-                        Picker("Style", selection: $style) {
-                            ForEach(StyleOptions.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-                        }
-                    }
-                }
-            }
+            .onSubmit(of: .search) { Task { await search() } }
+            .toolbar { toolbarContent }
             .safeAreaInset(edge: .bottom) {
-                VStack(spacing: 0) {
+                VStack(spacing: 8) {
                     if let result {
-                        locationCard(result)
+                        resultCard(result)
                     }
-                    MapPanel(transport: $transport, legs: legs, stopCount: selectedIDs.count) {
-                        Task {
-                            await updateRoute()
-                        }
-                    }
-                }
-            }
-            .onChange(of: transport) {
-                // recalculate route when transport type changes
-                if !legs.isEmpty {
-                    Task {
-                        await updateRoute()
+                    MapPanel(transport: $transport, avoidHighways: $avoidHighways,
+                             stops: stops, legs: legs, isCalculating: isCalculating) {
+                        Task { await calculateRoute() }
                     }
                 }
+                .padding(.horizontal)
+                .padding(.bottom, 8)
             }
-            // tap on marker = add/remove stop
-            .onChange(of: selection) { _, id in
-                guard let id else { return }
-                if let i = selectedIDs.firstIndex(of: id) { selectedIDs.remove(at: i) }
-                else { selectedIDs.append(id) }
-                legs = []          // old route is no longer valid
-                selection = nil    // so the same marker can be tapped again
+            // recalculate when route options change
+            .onChange(of: transport) { if !legs.isEmpty { Task { await calculateRoute() } } }
+            .onChange(of: avoidHighways) { if !legs.isEmpty { Task { await calculateRoute() } } }
+            .onChange(of: selection) { _, newSelection in
+                handleSelection(newSelection)
             }
+            // load Look Around scene whenever the result changes (result is only from search)
+            .task(id: result) {
+                lookAroundScene = nil
+                guard let result else { return }
+                lookAroundScene = try? await MKLookAroundSceneRequest(mapItem: result).scene
+            }
+            .task { locationManager.requestWhenInUseAuthorization() }
         }
-        .mapItemDetailSheet(isPresented: $showDetails, item: result)
-    }
-    
-    @MapContentBuilder
-    private var placeMarkers: some MapContent {
-        ForEach(places) { place in
-            Marker(place.name, coordinate: place.coordinate)
-                .tint(selectedIDs.contains(place.id) ? .blue : .red)
-                .tag(place.id)
-        }
+        .mapItemDetailSheet(isPresented: $showDetails, item: result) // ready to go detail sheet in MapKit (only item is required)
     }
 
     @MapContentBuilder
-    private var routeLines: some MapContent {
-        ForEach(legs, id: \.self) { leg in
-            MapPolyline(leg.polyline).stroke(.blue, lineWidth: 5)
+    private var placeContent: some MapContent {
+        ForEach(places) { place in
+            let stopNumber = stopIDs.firstIndex(of: place.id).map { $0 + 1 }
+
+            if place.kind == .landmark {
+                // marker
+                if let stopNumber {
+                    Marker(place.name, monogram: Text("\(stopNumber)"), coordinate: place.coordinate)
+                        .tint(.blue)
+                        .tag(MapSelection(place.id))
+                } else {
+                    Marker(place.name, systemImage: place.systemImage, coordinate: place.coordinate)
+                        .tint(.red)
+                        .tag(MapSelection(place.id))
+                }
+            } else {
+                // annotation
+                Annotation(place.name, coordinate: place.coordinate, anchor: .bottom) {
+                    PlaceAnnotationView(place: place, stopNumber: stopNumber)
+                }
+                .tag(MapSelection(place.id))
+            }
         }
     }
     
-    // card for the found place: details, waypoint
-    private func locationCard(_ item: MKMapItem) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(item.name ?? "Result").font(.headline).lineLimit(1)
-                Spacer()
-                Button("Close", systemImage: "xmark") { result = nil }
-                    .labelStyle(.iconOnly)
+    // routes, alternate routes are grey
+    @MapContentBuilder
+    private var routeLines: some MapContent {
+        ForEach(legs) { leg in
+            ForEach(leg.alternatives, id: \.self) { alternative in
+                MapPolyline(alternative)
+                    .stroke(.gray.opacity(0.7), lineWidth: 4)
             }
+            if let polyline = leg.polyline {
+                MapPolyline(polyline)
+                    .stroke(leg.color, style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round))
+            } else {
+                // transit: no geometry from MapKit → dashed straight line
+                MapPolyline(coordinates: [leg.from.coordinate, leg.to.coordinate])
+                    .stroke(leg.color, style: StrokeStyle(lineWidth: 4, lineCap: .round, dash: [8, 8]))
+            }
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Button("Zurücksetzen", systemImage: "arrow.counterclockwise", action: reset)
+        }
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            Button(followTask == nil ? "Route abfahren" : "Stopp",
+                   systemImage: followTask == nil ? "play.fill" : "stop.fill",
+                   action: toggleFollowing)
+                .disabled(legs.allSatisfy { $0.polyline == nil })
+
+            Menu("Kartenstil", systemImage: "map") {
+                Picker("Stil", selection: $styleSettings.base) {
+                    ForEach(MapStyleSettings.Base.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                Section("Optionen") {
+                    Toggle("3D (realistisch)", isOn: $styleSettings.realistic3D)
+                    Toggle("Verkehr", isOn: $styleSettings.showsTraffic)
+                        .disabled(styleSettings.base == .imagery)
+                    Toggle("Points of Interest", isOn: $styleSettings.showsPOIs)
+                        .disabled(styleSettings.base == .imagery)
+                    Toggle("Gedämpft", isOn: $styleSettings.muted)
+                        .disabled(styleSettings.base != .standard)
+                }
+            }
+        }
+    }
+
+    private var zoomButtons: some View {
+        VStack(spacing: 0) {
+            Button { zoom(by: 0.5) } label: {
+                Image(systemName: "plus").frame(width: 44, height: 44)
+            }
+            Divider().frame(width: 44)
+            Button { zoom(by: 2) } label: {
+                Image(systemName: "minus").frame(width: 44, height: 44)
+            }
+        }
+        .font(.title3.weight(.medium))
+        .background(.regularMaterial, in: .rect(cornerRadius: 12))
+        .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
+        .padding(.trailing, 8)
+    }
+
+    // search result card
+    private func resultCard(_ item: MKMapItem) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.name ?? "Ergebnis").font(.headline).lineLimit(1)
+                    if let address = item.address?.shortAddress {
+                        Text(address).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                Spacer()
+                Button("Schließen", systemImage: "xmark.circle.fill") { result = nil }
+                    .labelStyle(.iconOnly)
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let lookAroundScene {
+                LookAroundPreview(initialScene: lookAroundScene)
+                    .frame(height: 120)
+                    .clipShape(.rect(cornerRadius: 12))
+            }
+
             HStack {
                 Button("Details", systemImage: "info.circle") { showDetails = true }
-                Button("Waypoint", systemImage: "mappin") { addResult(item) }
+                Button("Als Stopp", systemImage: "plus.circle") { addAsStop(item) }
             }
             .buttonStyle(.bordered)
         }
-        .padding()
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial)
+        .padding(16)
+        .cardStyle()
+    }
+    
+    private func handleSelection(_ newSelection: MapSelection<UUID>?) {
+        guard let newSelection else { return }
+        if let id = newSelection.value {
+            // own place tapped → add / remove as stop
+            if let i = stopIDs.firstIndex(of: id) { stopIDs.remove(at: i) } else { stopIDs.append(id) }
+            legs = []
+        } else if let feature = newSelection.feature {
+            Task {
+                if let item = try? await MKMapItemRequest(feature: feature).mapItem {
+                    showResult(item, moveCamera: false)
+                }
+            }
+        }
+        selection = nil
     }
 
-    // found place becomes a normal place + the next stop
-    private func addResult(_ item: MKMapItem) {
-        let location = Location(name: item.name ?? "Result", coordinate: item.location.coordinate)
+    private func addAsStop(_ item: MKMapItem) {
+        let location = Location(name: item.name ?? "Ergebnis", coordinate: item.location.coordinate,
+                                kind: .custom, systemImage: "star.fill")
         places.append(location)
-        selectedIDs.append(location.id)
+        stopIDs.append(location.id)
         legs = []
         result = nil
     }
-    
-    private func updateRoute() async {
-        let items = selectedIDs.compactMap {
-            id in places.first { $0.id == id }?.mapItem
-        }
-        guard items.count > 1 else {
-            legs = [];
-            return
-        }
-        // ÖPNV directs to Apple Karten
-        if transport == .transit {
-            MKMapItem.openMaps(
-                with: [items.first!, items.last!],
-                launchOptions: [MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeTransit]
-            )
-            return
-        }
-        var routes: [MKRoute] = []
-        for (a, b) in zip(items, items.dropFirst()) {
-            let req = MKDirections.Request()
-            req.source = a
-            req.destination = b
-            req.transportType = transport.type
-            if let route = try? await MKDirections(request: req).calculate().routes.first {
-                routes.append(route)
+
+    private func calculateRoute() async {
+        let stops = stops
+        guard stops.count > 1 else { legs = []; return }
+        stopFollowing()
+        isCalculating = true
+        defer { isCalculating = false }
+
+        var newLegs: [RouteLeg] = []
+        for (index, (from, to)) in zip(stops, stops.dropFirst()).enumerated() {
+            let request = MKDirections.Request()
+            request.source = from.mapItem
+            request.destination = to.mapItem
+            request.transportType = transport.type
+            if transport == .car {
+                request.highwayPreference = avoidHighways ? .avoid : .any
+            }
+
+            if transport.supportsRoutes {
+                request.requestsAlternateRoutes = true
+                guard let routes = try? await MKDirections(request: request).calculate().routes,
+                      let best = routes.first else { continue }
+                newLegs.append(RouteLeg(
+                    index: index, from: from, to: to,
+                    distance: best.distance,
+                    travelTime: best.expectedTravelTime,
+                    polyline: best.polyline,
+                    alternatives: routes.dropFirst().map(\.polyline),
+                    steps: best.steps.map(\.instructions).filter { !$0.isEmpty }
+                ))
+            } else {
+                // transit: MapKit can only calculate the travel time (ETA)
+                guard let eta = try? await MKDirections(request: request).calculateETA() else { continue }
+                newLegs.append(RouteLeg(
+                    index: index, from: from, to: to,
+                    distance: eta.distance,
+                    travelTime: eta.expectedTravelTime
+                ))
             }
         }
-        legs = routes
+        legs = newLegs
+        showWholeRoute()
     }
-    
-    // searching and selecting a location
-    private func searchMap() async {
-        let req = MKLocalSearch.Request()
-        req.naturalLanguageQuery = query
-        if let visibleRegion { req.region = visibleRegion }
-        guard let item = try? await MKLocalSearch(request: req).start().mapItems.first else { return }
-        showLocation(item)
-    }
-    
-    private func selectLocation(_ s: MKLocalSearchCompletion) async {
-        let req = MKLocalSearch.Request(completion: s)
-        guard let item = try? await MKLocalSearch(request: req).start().mapItems.first else { return }
-        showLocation(item)
-    }
-    
-    private func showLocation(_ item: MKMapItem) {
-        query = ""
-        result = item
+
+    private func showWholeRoute() {
+        var rect = MKMapRect.null
+        for leg in legs {
+            if let polyline = leg.polyline {
+                rect = rect.union(polyline.boundingMapRect)
+            } else {
+                for coordinate in [leg.from.coordinate, leg.to.coordinate] {
+                    let point = MKMapPoint(coordinate)
+                    rect = rect.union(MKMapRect(origin: point, size: MKMapSize(width: 0, height: 0)))
+                }
+            }
+        }
+        guard !rect.isNull else { return }
+        let padding = max(rect.width, rect.height) * 0.2
         withAnimation {
-            cameraPosition = .region(MKCoordinateRegion(
-                center: item.location.coordinate,
-                span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)))
+            cameraPosition = .rect(rect.insetBy(dx: -padding, dy: -padding))
         }
     }
-    
-    // follow calculated route (animation)
-    private func followRoute() async {
-        followRoute = true
-        let points = legs.flatMap(\.steps).compactMap {
-            $0.polyline.coords.first
-        }
-        
-        for (a, b) in zip(points, points.dropFirst()) {
-            withAnimation(.linear(duration: 2)) {
-                cameraPosition = .camera(MapCamera(centerCoordinate: a, distance: 400,
-                                                   heading: followDirection(a, b), pitch: 70))
+
+    private func toggleFollowing() {
+        if followTask != nil {
+            stopFollowing()
+        } else {
+            followTask = Task {
+                await followRoute()
+                followTask = nil
             }
-            try? await Task.sleep(for: .seconds(2))
         }
-        followRoute = false
-        cameraPosition = .automatic
+    }
+
+    private func stopFollowing() {
+        followTask?.cancel()
+        followTask = nil
     }
     
-    private func followDirection(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> Double {
+    // camera follows calculated route
+    private func followRoute() async {
+        let all = legs.compactMap(\.polyline).flatMap(\.coordinates)
+        guard all.count > 1 else { return }
+        // ~ 40 points
+        let stride = max(1, all.count / 40)
+        let points = Swift.stride(from: 0, to: all.count, by: stride).map { all[$0] } + [all[all.count - 1]]
+
+        for (a, b) in zip(points, points.dropFirst()) {
+            if Task.isCancelled { return }
+            withAnimation(.linear(duration: 1.5)) {
+                cameraPosition = .camera(MapCamera(centerCoordinate: a, distance: 500,
+                                                   heading: heading(from: a, to: b), pitch: 65))
+            }
+            try? await Task.sleep(for: .seconds(1.5))
+        }
+        if !Task.isCancelled { showWholeRoute() }
+    }
+
+    private func heading(from a: CLLocationCoordinate2D, to b: CLLocationCoordinate2D) -> Double {
         atan2((b.longitude - a.longitude) * cos(a.latitude * .pi / 180), b.latitude - a.latitude) * 180 / .pi
     }
+
+    // called by zoom buttons
+    private func zoom(by factor: Double) {
+        guard let camera else { return }
+        withAnimation {
+            cameraPosition = .camera(MapCamera(
+                centerCoordinate: camera.centerCoordinate,
+                distance: camera.distance * factor,
+                heading: camera.heading,
+                pitch: camera.pitch
+            ))
+        }
+    }
     
-    // long press on map = add new place
-    private func createLocation(_ proxy: MapProxy) -> some Gesture {
+    // reset everything
+    private func reset() {
+        stopFollowing()
+        legs = []
+        stopIDs = []
+        places = Location.samples
+        result = nil
+        transport = .walking
+        avoidHighways = false
+        styleSettings = MapStyleSettings()
+        withAnimation { cameraPosition = .region(Location.vienna) }
+    }
+
+    private func search() async {
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = query
+        if let visibleRegion { request.region = visibleRegion }
+        guard let item = try? await MKLocalSearch(request: request).start().mapItems.first else { return }
+        showResult(item)
+    }
+
+    private func selectCompletion(_ completion: MKLocalSearchCompletion) async {
+        // resolves the tapped search suggestion (text only) into a full MKMapItem via MKLocalSearch and shows it.
+        let request = MKLocalSearch.Request(completion: completion)
+        guard let item = try? await MKLocalSearch(request: request).start().mapItems.first else { return }
+        showResult(item)
+    }
+
+    private func showResult(_ item: MKMapItem, moveCamera: Bool = true) {
+        query = ""
+        result = item
+        guard moveCamera else { return }
+        withAnimation {
+            cameraPosition = .item(item)
+        }
+    }
+
+    // long pressing adds new place
+    private func addPlaceGesture(_ proxy: MapProxy) -> some Gesture {
         LongPressGesture(minimumDuration: 0.5)
             .sequenced(before: DragGesture(minimumDistance: 0))
             .onEnded { value in
-                guard case .second(true, let drag?) = value else { return }
-                guard let coord = proxy.convert(drag.location, from: .local) else { return }
-                let name = "Point \(places.count + 1)"
-                places.append(
-                    Location(name: name, coordinate: coord)
-                )
+                guard case .second(true, let drag?) = value,
+                      let coordinate = proxy.convert(drag.location, from: .local) else { return }
+                let number = places.filter { $0.kind == .custom }.count + 1
+                places.append(Location(name: "Punkt \(number)", coordinate: coordinate))
             }
-    }
-}
-
-extension Location {
-    var mapItem: MKMapItem {
-        MKMapItem(location: CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude), address: nil)
     }
 }
 
 extension MKPolyline {
-    var coords: [CLLocationCoordinate2D] {
-        var c = [CLLocationCoordinate2D](repeating: .init(), count: pointCount)
-        getCoordinates(&c, range: NSRange(location: 0, length: pointCount))
-        return c
+    var coordinates: [CLLocationCoordinate2D] {
+        var result = [CLLocationCoordinate2D](repeating: .init(), count: pointCount)
+        getCoordinates(&result, range: NSRange(location: 0, length: pointCount))
+        return result
     }
 }
