@@ -34,10 +34,17 @@ struct MapPanel: View {
             }
             .pickerStyle(.segmented)
 
-            if transport == .car {
+            ZStack(alignment: .leading) {
                 Toggle("Autobahnen vermeiden", isOn: $avoidHighways)
-                    .font(.subheadline)
+                    .opacity(transport == .car ? 1 : 0)
+                    .disabled(transport != .car)
+
+                if transport != .car {
+                    Label(transportInfo, systemImage: "info.circle")
+                        .foregroundStyle(.secondary)
+                }
             }
+            .font(.subheadline)
 
             if stops.count < 2 {
                 hint
@@ -65,6 +72,15 @@ struct MapPanel: View {
         }
         .padding(16)
         .cardStyle()
+    }
+
+    private var transportInfo: String {
+        switch transport {
+        case .walking: "Fußwege inkl. Alternativrouten"
+        case .cycling: "Radwege inkl. Alternativrouten"
+        case .transit: "ÖPNV: MapKit liefert nur die Fahrzeit"
+        case .car: ""
+        }
     }
 
     private var hint: some View {
